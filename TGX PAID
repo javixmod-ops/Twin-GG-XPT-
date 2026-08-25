@@ -1,9 +1,7 @@
 -- JXVI SHOOTER ASSIST · LocalScript oficial
--- TWIN GG XPT · ARCHIVO ÚNICO DE REFERENCIA
--- Parte superior: LocalScript para StarterPlayer > StarterPlayerScripts.
--- Bloque de servidor comentado al final: expansor Root controlado por la pestaña HITBOX.
+-- Colócalo en StarterPlayer > StarterPlayerScripts.
 -- Diseñado como mecánica de tu propio shooter. No modifica impactos ni contiene Silent Aimbot.
--- No incluye comprobaciones de compra, claves ni una GUI externa de activar/desactivar.
+-- Sin compras, claves ni GUI externa de Hitbox.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -15,6 +13,7 @@ local GuiService = game:GetService("GuiService")
 local Lighting = game:GetService("Lighting")
 
 local player = Players.LocalPlayer
+local LocalPlayer = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
 local CONFIG = {
@@ -44,8 +43,8 @@ local state = {
 	epsHealth = false,
 	epsDistance = false,
 	selectedTarget = nil,
-	hitboxEnabled = false,
-	hitboxVisible = false,
+	hitboxEnabled = true,
+	hitboxVisible = true,
 	hitboxSize = 10,
 	hitboxServerConfirmed = false,
 	playerSpeed = 16,
@@ -53,6 +52,13 @@ local state = {
 	noclip = false,
 	antiLag = false,
 }
+
+-- Variables del expansor LocalScript aportado. La pestaña HITBOX las controla directamente.
+local isHitboxActive = true
+local hitboxSize = 10
+local showVisualBox = true
+local LOCAL_HITBOX_MODE = true
+local restoreLocalHitboxExpander
 
 local translations = {
 	ES = {
@@ -142,6 +148,13 @@ local hitboxSyncQueued = false
 local hitboxRequestId = 0
 local hitboxResponseId = 0
 local hitboxServerReady = false
+local gui
+local hitboxAdjustOverlay
+local hitboxAdjustText
+local hitboxAdjustSpinner
+local hitboxAdjustToken = 0
+local beginHitboxAdjustment
+local finishHitboxAdjustment
 
 local function setHitboxStatus(message, color)
 	hitboxStatus = message
@@ -165,51 +178,62 @@ local function bindHitboxRemote()
 			hitboxResponseId = responseId or hitboxRequestId
 			local confirmed = payload.ok == true and payload.realActive == true and state.hitboxEnabled
 			state.hitboxServerConfirmed = confirmed
-			if confirmed then
-				local realSize = tonumber(payload.size) or state.hitboxSize
-				state.hitboxSize = math.clamp(realSize, CONFIG.HitboxMinSize, CONFIG.HitboxMaxSize)
-				setHitboxStatus("ACTIVADO CORRECTAMENTE · VOLUMEN REAL " .. string.format("%.1f", state.hitboxSize) .. " STUDS", GREEN)
-			elseif state.hitboxEnabled then
-				setHitboxStatus("VISTA LOCAL · SERVIDOR HITBOX NO DETECTADO", RED)
-			else
-				setHitboxStatus("HITBOX DESACTIVADA", MUTED)
+				if confirmed then
+					local realSize = tonumber(payload.size) or state.hitboxSize
+					state.hitboxSize = math.clamp(realSize, CONFIG.HitboxMinSize, CONFIG.HitboxMaxSize)
+					local detail = type(payload.message) == "string" and payload.message or ("VOLUMEN REAL " .. string.format("%.1f", state.hitboxSize) .. " STUDS")
+					setHitboxStatus("ACTIVADO CORRECTAMENTE · " .. detail, GREEN)
+					if finishHitboxAdjustment then finishHitboxAdjustment(true, "HITBOX APLICADA · " .. detail) end
+				elseif state.hitboxEnabled then
+					setHitboxStatus("VISTA LOCAL · SERVIDOR HITBOX NO DETECTADO", RED)
+					if finishHitboxAdjustment then finishHitboxAdjustment(false, "NO SE PUDO APLICAR LA HITBOX") end
+				else
+					setHitboxStatus("HITBOX DESACTIVADA", MUTED)
+					if finishHitboxAdjustment then finishHitboxAdjustment(false, "HITBOX DESACTIVADA") end
 			end
 		end)
 	end
 	return hitboxServerReady and hitboxRemote or nil
 end
 local function syncHitboxSettings()
+	if LOCAL_HITBOX_MODE then return end
 	local remote = bindHitboxRemote()
 	if remote then
 		hitboxRequestId += 1
-		local requestId = hitboxRequestId
-		state.hitboxServerConfirmed = false
-		setHitboxStatus("SINCRONIZANDO VOLUMEN REAL...", ACCENT)
-		remote:FireServer({
+			local requestId = hitboxRequestId
+			state.hitboxServerConfirmed = false
+			setHitboxStatus("SINCRONIZANDO VOLUMEN REAL...", ACCENT)
+			if state.hitboxEnabled and beginHitboxAdjustment then
+				beginHitboxAdjustment("DETECTANDO JUGADORES Y AJUSTANDO ROOT...")
+			end
+			remote:FireServer({
 			enabled = state.hitboxEnabled,
 			showDebug = state.hitboxVisible,
 			size = state.hitboxSize,
 			requestId = requestId,
 		})
 		task.delay(1.5, function()
-			if state.hitboxEnabled and hitboxRequestId == requestId and hitboxResponseId < requestId then
-				state.hitboxServerConfirmed = false
-				setHitboxStatus("VISTA LOCAL · SERVIDOR HITBOX NO DETECTADO", RED)
+				if state.hitboxEnabled and hitboxRequestId == requestId and hitboxResponseId < requestId then
+					state.hitboxServerConfirmed = false
+					setHitboxStatus("VISTA LOCAL · SERVIDOR HITBOX NO DETECTADO", RED)
+					if finishHitboxAdjustment then finishHitboxAdjustment(false, "TIEMPO DE ESPERA DEL SERVIDOR") end
 			end
 		end)
 	elseif state.hitboxEnabled then
 		state.hitboxServerConfirmed = false
 		setHitboxStatus("VISTA LOCAL · SERVIDOR HITBOX NO DETECTADO", RED)
+		if finishHitboxAdjustment then finishHitboxAdjustment(false, "CONTROLADOR DE SERVIDOR NO DETECTADO") end
 	else
 		state.hitboxServerConfirmed = false
 		setHitboxStatus(state.hitboxVisible and "CUBO VISUAL ACTIVO" or "MODO VISUAL LISTO", ACCENT)
+		if finishHitboxAdjustment then finishHitboxAdjustment(false, "HITBOX DESACTIVADA") end
 	end
 end
 
 local function queueHitboxSync()
 	if hitboxSyncQueued then return end
 	hitboxSyncQueued = true
-	task.delay(0.08, function()
+	task.delay(0.14, function()
 		hitboxSyncQueued = false
 		syncHitboxSettings()
 	end)
@@ -218,6 +242,8 @@ end
 -- El Script de servidor puede iniciarse después de la GUI. Esperar el RemoteEvent
 -- evita que una carga lenta quede permanentemente en “servidor no detectado”.
 task.spawn(function()
+	if LOCAL_HITBOX_MODE then return end
+	while not gui do task.wait() end
 	while gui.Parent and not bindHitboxRemote() do
 		if state.hitboxEnabled then setHitboxStatus("ESPERANDO SCRIPT DE SERVIDOR HITBOX...", ACCENT) end
 		task.wait(0.4)
@@ -226,6 +252,7 @@ task.spawn(function()
 end)
 
 ReplicatedStorage.ChildAdded:Connect(function(child)
+	if LOCAL_HITBOX_MODE then return end
 	if child.Name == "TGX_HitboxControl" or child.Name == "TGX_HitboxServerReady" then
 		if bindHitboxRemote() and state.hitboxEnabled then queueHitboxSync() end
 	end
@@ -282,7 +309,7 @@ local function setAntiLag(enabled)
 	end
 end
 
-local gui = create("ScreenGui", {
+gui = create("ScreenGui", {
 	Name = "TwinGGXPT",
 	Enabled = false,
 	IgnoreGuiInset = true,
@@ -332,6 +359,75 @@ local fovLoadingText = create("TextLabel", {
 	TextSize = 14,
 	ZIndex = 202,
 }, fovAdjustOverlay)
+
+-- Capa exclusiva de HITBOX: bloquea visualmente la pantalla mientras el servidor
+-- detecta jugadores y aplica el HumanoidRootPart del tamaño elegido.
+hitboxAdjustOverlay = create("Frame", {
+	Active = true,
+	BackgroundColor3 = Color3.fromRGB(3, 14, 39),
+	BackgroundTransparency = 0.02,
+	BorderSizePixel = 0,
+	Size = UDim2.fromScale(1, 1),
+	Visible = false,
+	ZIndex = 220,
+}, gui)
+local hitboxSpinner = create("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack,
+	Position = UDim2.fromScale(0.5, 0.45),
+	Size = UDim2.fromOffset(68, 68),
+	Text = "◔",
+	TextColor3 = ACCENT,
+	TextSize = 56,
+	ZIndex = 221,
+}, hitboxAdjustOverlay)
+hitboxAdjustSpinner = hitboxSpinner
+hitboxAdjustText = create("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	Position = UDim2.fromScale(0.5, 0.53),
+	Size = UDim2.fromOffset(380, 28),
+	Text = "AJUSTANDO HITBOX...",
+	TextColor3 = WHITE,
+	TextSize = 15,
+	ZIndex = 222,
+}, hitboxAdjustOverlay)
+hitboxAdjustText.TextXAlignment = Enum.TextXAlignment.Center
+local hitboxAdjustSubtext = create("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.RobotoMono,
+	Position = UDim2.fromScale(0.5, 0.57),
+	Size = UDim2.fromOffset(440, 20),
+	Text = "HITBOX 5–50 STUDS · VOLUMEN REAL DE SERVIDOR",
+	TextColor3 = ACCENT,
+	TextSize = 8,
+	ZIndex = 222,
+}, hitboxAdjustOverlay)
+hitboxAdjustSubtext.TextXAlignment = Enum.TextXAlignment.Center
+
+beginHitboxAdjustment = function(message)
+	hitboxAdjustToken += 1
+	hitboxAdjustOverlay.Visible = true
+	hitboxAdjustText.Text = message or "AJUSTANDO HITBOX..."
+	hitboxAdjustText.TextColor3 = WHITE
+	hitboxAdjustSpinner.Rotation = 0
+	TweenService:Create(hitboxAdjustSpinner, TweenInfo.new(0.48, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1), {Rotation = 360}):Play()
+end
+
+finishHitboxAdjustment = function(ok, message)
+	local token = hitboxAdjustToken
+	if not hitboxAdjustOverlay.Visible then return end
+	hitboxAdjustText.Text = message or (ok and "HITBOX AJUSTADA ✓" or "HITBOX DESACTIVADA")
+	hitboxAdjustText.TextColor3 = ok and GREEN or (message and RED or MUTED)
+	task.delay(ok and 0.65 or 0.9, function()
+		if hitboxAdjustToken == token and hitboxAdjustOverlay.Parent then
+			hitboxAdjustOverlay.Visible = false
+		end
+	end)
+end
 
 local root = create("Frame", {
 	Active = true,
@@ -718,14 +814,17 @@ end
 
 local function renderHitboxPage()
 	local page = makePage("HITBOX")
-	sectionTitle(page, t("pageHitbox"), "ROOT REAL 5–50 STUDS · CONTROL DE SERVIDOR")
+	sectionTitle(page, t("pageHitbox"), "EXPANDER LOCAL 5–50 STUDS")
 	toggle(page, 65, t("hitbox"), function() return state.hitboxEnabled end, function(value)
 		state.hitboxEnabled = value
-		queueHitboxSync()
+		isHitboxActive = value
+		if not value and restoreLocalHitboxExpander then restoreLocalHitboxExpander() end
+		setHitboxStatus(value and "HITBOX EXPANDER ACTIVADA" or "HITBOX EXPANDER DESACTIVADA", value and GREEN or MUTED)
 	end)
 	toggle(page, 100, t("showHitbox"), function() return state.hitboxVisible end, function(value)
 		state.hitboxVisible = value
-		queueHitboxSync()
+		showVisualBox = value
+		setHitboxStatus(value and "CUADRADO DE HITBOX VISIBLE" or "CUADRADO DE HITBOX OCULTO", value and ACCENT or MUTED)
 	end)
 
 	label(page, t("hitboxSize"), UDim2.fromOffset(16, 143), UDim2.new(1, -32, 0, 18), Enum.Font.GothamMedium, WHITE, 11)
@@ -753,10 +852,11 @@ local function renderHitboxPage()
 	local function updateSlider(input)
 		local ratio = math.clamp((input.Position.X - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1)
 		state.hitboxSize = math.round((CONFIG.HitboxMinSize + range * ratio) * 10) / 10
+		hitboxSize = state.hitboxSize
 		fill.Size = UDim2.fromScale(ratio, 1)
 		handle.Position = UDim2.fromScale(ratio, 0.5)
 		valueText.Text = string.format("%.1f studs", state.hitboxSize)
-		queueHitboxSync()
+		setHitboxStatus("TAMAÑO DE HITBOX: " .. string.format("%.1f", hitboxSize) .. " STUDS", ACCENT)
 	end
 	bar.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -775,11 +875,7 @@ local function renderHitboxPage()
 	corner(statusPanel, 9)
 	label(statusPanel, "ESTADO DE HITBOX", UDim2.fromOffset(10, 7), UDim2.new(1, -20, 0, 12), Enum.Font.RobotoMono, MUTED, 7)
 	hitboxStatusLabel = label(statusPanel, hitboxStatus, UDim2.fromOffset(10, 22), UDim2.new(1, -20, 0, 17), Enum.Font.GothamBold, hitboxStatusColor, 8)
-	if state.hitboxEnabled and not state.hitboxServerConfirmed then
-		setHitboxStatus("VISTA LOCAL · SERVIDOR HITBOX NO DETECTADO", RED)
-	elseif state.hitboxVisible and not state.hitboxServerConfirmed then
-		setHitboxStatus("CUBO VISUAL ACTIVO", ACCENT)
-	end
+	setHitboxStatus(isHitboxActive and "HITBOX EXPANDER ACTIVADA" or "HITBOX EXPANDER DESACTIVADA", isHitboxActive and GREEN or MUTED)
 end
 
 local function renderEpsPage()
@@ -1454,234 +1550,41 @@ refreshPage()
 -- Inicio directo de Twin GG XPT, sin pantalla ni validación de key.
 gui.Enabled = true
 
---[[
-================================================================================
- BLOQUE SERVIDOR · PON ESTE BLOQUE COMO SCRIPT EN ServerScriptService
-================================================================================
-El código superior es el LocalScript de GUI. Roblox exige que los cambios de
-Hitbox físicos se hagan desde servidor; por ello, copia este bloque como Script
-en ServerScriptService. La GUI superior lo detectará sola y usará sus controles
-HITBOX para activar/desactivar Root real entre 5 y 50 studs.
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-
-local ALLOWED_USER_IDS = {
-	-- Fuera de Studio, añade aquí UserIds autorizados si no eres el creador.
-}
-local MIN_HITBOX_SIZE, MAX_HITBOX_SIZE = 5, 50
-local CONTROL_COOLDOWN, REFRESH_SECONDS = 0.12, 0.35
-
-local function getOrCreateRemote(name)
-	local remote = ReplicatedStorage:FindFirstChild(name)
-	if remote and not remote:IsA("RemoteEvent") then
-		error("ReplicatedStorage." .. name .. " debe ser un RemoteEvent")
-	end
-	if not remote then
-		remote = Instance.new("RemoteEvent")
-		remote.Name = name
-		remote.Parent = ReplicatedStorage
-	end
-	return remote
-end
-
-local controlRemote = getOrCreateRemote("TGX_HitboxControl")
-local serverReady = ReplicatedStorage:FindFirstChild("TGX_HitboxServerReady")
-if serverReady and not serverReady:IsA("BoolValue") then
-	error("ReplicatedStorage.TGX_HitboxServerReady debe ser un BoolValue")
-end
-if not serverReady then
-	serverReady = Instance.new("BoolValue")
-	serverReady.Name = "TGX_HitboxServerReady"
-	serverReady.Parent = ReplicatedStorage
-end
-serverReady.Value = true
-print("[TGX] SERVIDOR LISTO · TGX_HitboxControl y TGX_HitboxServerReady creados en ReplicatedStorage.")
-
-local originalRoots, debugBoxes, lastControlAt = {}, {}, {}
-local activeController, activeSettings, lastRefreshAt = nil, nil, 0
-
-local function isAllowed(player)
-	if RunService:IsStudio() then return true end
-	if game.CreatorType == Enum.CreatorType.User and player.UserId == game.CreatorId then return true end
-	return table.find(ALLOWED_USER_IDS, player.UserId) ~= nil
-end
-
-local function notify(player, ok, message, requestId, realActive, size)
-	controlRemote:FireClient(player, {
-		ok = ok, message = message, requestId = requestId,
-		realActive = realActive == true, size = size,
-	})
-end
-
-local function getRoot(targetPlayer)
-	local character = targetPlayer.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	local root = character and character:FindFirstChild("HumanoidRootPart")
-	if humanoid and humanoid.Health > 0 and root and root:IsA("BasePart") then return root end
-	return nil
-end
-
-local function destroyBox(targetPlayer)
-	local box = debugBoxes[targetPlayer]
-	if box then box:Destroy() end
-	debugBoxes[targetPlayer] = nil
-end
-
-local function restoreTarget(targetPlayer)
-	destroyBox(targetPlayer)
-	local saved = originalRoots[targetPlayer]
-	if saved and saved.root and saved.root.Parent then
-		saved.root.Size = saved.size
-		saved.root.Massless = saved.massless
-		saved.root.CanQuery = saved.canQuery
-		saved.root.CanCollide = saved.canCollide
-	end
-	originalRoots[targetPlayer] = nil
-end
-
-local function expandRoot(targetPlayer, size)
-	local root = getRoot(targetPlayer)
-	if not root then restoreTarget(targetPlayer); return nil end
-	local saved = originalRoots[targetPlayer]
-	if saved and saved.root ~= root then restoreTarget(targetPlayer); saved = nil end
-	if not saved then
-		originalRoots[targetPlayer] = {
-			root = root, size = root.Size, massless = root.Massless, canQuery = root.CanQuery, canCollide = root.CanCollide,
-		}
-	end
-	root.Size = Vector3.new(size, size, size)
-	root.Massless = true
-	root.CanQuery = true
-	root.CanCollide = false
-	return root
-end
-
-local function verifyRootQuery(root)
-	if not root or not root:IsDescendantOf(workspace) or not root.CanQuery then return false end
-	local half = root.Size.Z * 0.5
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Include
-	params.FilterDescendantsInstances = {root}
-	params.IgnoreWater = true
-	local origin = root.Position - root.CFrame.LookVector * (half + 1)
-	local result = workspace:Raycast(origin, root.CFrame.LookVector * (root.Size.Z + 2), params)
-	return result ~= nil and result.Instance == root
-end
-
-local function setDebugBox(targetPlayer, root, size, visible)
-	if not visible or not root then destroyBox(targetPlayer); return end
-	local box = debugBoxes[targetPlayer]
-	if not box then
-		box = Instance.new("BoxHandleAdornment")
-		box.Name = "TGX_HitboxDebug_" .. targetPlayer.UserId
-		box.AlwaysOnTop = true
-		box.Color3 = Color3.fromRGB(70, 199, 255)
-		box.Transparency = 0.58
-		box.ZIndex = 10
-		box.Parent = workspace
-		debugBoxes[targetPlayer] = box
-	end
-	box.Adornee = root
-	box.Size = Vector3.new(size, size, size)
-end
-
-local function clearAllTargets()
-	for targetPlayer in pairs(originalRoots) do restoreTarget(targetPlayer) end
-	for targetPlayer in pairs(debugBoxes) do destroyBox(targetPlayer) end
-end
-
-local function applyTarget(targetPlayer, controller, settings)
-	if targetPlayer == controller then return false end
-	local root = expandRoot(targetPlayer, settings.size)
-	setDebugBox(targetPlayer, root, settings.size, settings.showDebug)
-	return verifyRootQuery(root)
-end
-
-local function applyAllTargets(controller, settings)
-	clearAllTargets()
-	local candidates, verified = 0, 0
-	for _, targetPlayer in ipairs(Players:GetPlayers()) do
-		if targetPlayer ~= controller and getHumanoidRoot(targetPlayer) then
-			candidates += 1
-			if applyTarget(targetPlayer, controller, settings) then verified += 1 end
-		end
-	end
-	return candidates, verified
-end
-
-local function refreshTargets()
-	if not activeController or not activeSettings then return end
-	for _, targetPlayer in ipairs(Players:GetPlayers()) do
-		if targetPlayer ~= activeController then
-			applyTarget(targetPlayer, activeController, activeSettings)
+-- Bucle principal del expansor de Hitbox aportado por el usuario.
+-- La GUI solo actualiza isHitboxActive, hitboxSize y showVisualBox.
+restoreLocalHitboxExpander = function()
+	for _, player in pairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+			if hrp then
+				hrp.Size = Vector3.new(2, 2, 1)
+				hrp.Transparency = 1
+			end
 		end
 	end
 end
 
-controlRemote.OnServerEvent:Connect(function(player, payload)
-	local requestId = type(payload) == "table" and tonumber(payload.requestId) or 0
-	if not requestId or not math.isfinite(requestId) then requestId = 0 end
-	requestId = math.floor(requestId)
-	if not isAllowed(player) then
-		notify(player, false, "NO TIENES PERMISO PARA HITBOX", requestId, false)
-		return
-	end
-	if type(payload) ~= "table" then
-		notify(player, false, "CONFIGURACIÓN HITBOX INVÁLIDA", requestId, false)
-		return
-	end
-	if os.clock() - (lastControlAt[player] or 0) < CONTROL_COOLDOWN then return end
-	lastControlAt[player] = os.clock()
-	if payload.enabled ~= true then
-		clearAllTargets()
-		if activeController == player then activeController, activeSettings = nil, nil end
-		notify(player, true, "HITBOX DESACTIVADA · ROOT RESTAURADOS", requestId, false)
-		return
-	end
-	local requestedSize = tonumber(payload.size)
-	if not requestedSize or not math.isfinite(requestedSize) then
-		notify(player, false, "TAMAÑO HITBOX INVÁLIDO", requestId, false)
-		return
-	end
-	activeController = player
-	activeSettings = {
-		size = math.clamp(requestedSize, MIN_HITBOX_SIZE, MAX_HITBOX_SIZE),
-		showDebug = payload.showDebug == true,
-	}
-	local candidates, verified = applyAllTargets(player, activeSettings)
-	local ready = candidates == 0 or verified == candidates
-	local message = candidates == 0
-		and string.format("ROOT REAL %.1f STUDS · ESPERANDO OTRO JUGADOR", activeSettings.size)
-		or string.format("ROOT EXPANDIDOS %d/%d · %.1f STUDS", verified, candidates, activeSettings.size)
-	notify(player, ready, message, requestId, ready, activeSettings.size)
-end)
+RunService.RenderStepped:Connect(function()
+	if not isHitboxActive then return end
 
-local function watchPlayer(targetPlayer)
-	targetPlayer.CharacterAdded:Connect(function()
-		task.wait(0.2)
-		if activeController and activeSettings then applyTarget(targetPlayer, activeController, activeSettings) end
-	end)
-	targetPlayer.CharacterRemoving:Connect(function() restoreTarget(targetPlayer) end)
-end
-
-Players.PlayerAdded:Connect(watchPlayer)
-for _, targetPlayer in ipairs(Players:GetPlayers()) do watchPlayer(targetPlayer) end
-Players.PlayerRemoving:Connect(function(leaving)
-	lastControlAt[leaving] = nil
-	restoreTarget(leaving)
-	if activeController == leaving then clearAllTargets(); activeController, activeSettings = nil, nil end
-end)
-
-RunService.Heartbeat:Connect(function()
-	if activeController and activeSettings and os.clock() - lastRefreshAt >= REFRESH_SECONDS then
-		lastRefreshAt = os.clock()
-		refreshTargets()
+	for _, player in pairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+			
+			if hrp then
+				-- Modificar el tamaño y evitar que cause colisiones molestas al caminar
+				hrp.Size = Vector3.new(hitboxSize, hitboxSize, hitboxSize)
+				hrp.CanCollide = false
+				
+				-- Control visual de la hitbox
+				if showVisualBox then
+					hrp.Transparency = 0.6
+					hrp.Color = Color3.fromRGB(255, 0, 0)
+					hrp.Material = Enum.Material.Neon
+				else
+					hrp.Transparency = 1
+				end
+			end
+		end
 	end
 end)
-
-print("[TGX] Hitbox GUI lista: expande HumanoidRootPart de 5 a 50 studs.")
-================================================================================
-]]
-
